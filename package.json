@@ -8,7 +8,7 @@
   "author": "yangyang0507",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yangyang0507/pi-zenmux.git"
+    "url": "git+https://github.com/yangyang0507/pi-zenmux.git"
   },
   "bugs": {
     "url": "https://github.com/yangyang0507/pi-zenmux/issues"
@@ -26,15 +26,18 @@
   ],
   "files": [
     "index.ts",
+    "zenmux-models.generated.d.ts",
+    "zenmux-models.generated.js",
     "README.md"
   ],
   "scripts": {
     "clean": "rm -rf dist .tsbuildinfo",
-    "build": "npm run clean && tsc -p tsconfig.json",
+    "generate:models": "node scripts/generate-models.mjs",
+    "build": "npm run clean && tsc -p tsconfig.json && cp zenmux-models.generated.js dist/zenmux-models.generated.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/index.test.js",
     "check": "npm run typecheck && npm run test",
-    "prepack": "npm run check"
+    "prepack": "npm run generate:models && npm run check"
   },
   "pi": {
     "extensions": [
