@@ -1,0 +1,54 @@
+{
+  "name": "pi-zenmux",
+  "version": "0.1.0",
+  "description": "ZenMux provider extension for pi-mono",
+  "type": "module",
+  "main": "./index.ts",
+  "license": "MIT",
+  "author": "yangyang0507",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yangyang0507/pi-zenmux.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yangyang0507/pi-zenmux/issues"
+  },
+  "homepage": "https://github.com/yangyang0507/pi-zenmux#readme",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "zenmux",
+    "llm",
+    "ai",
+    "agent",
+    "cli"
+  ],
+  "files": [
+    "index.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist .tsbuildinfo",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/index.test.js",
+    "check": "npm run typecheck && npm run test",
+    "prepack": "npm run check"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@types/node": "^22.15.21",
+    "typescript": "^5.8.3"
+  }
+}
