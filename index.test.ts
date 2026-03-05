@@ -5,6 +5,8 @@ import {
 	FALLBACK_MODELS,
 	ZENMUX_ANTHROPIC_BASE_URL,
 	ZENMUX_OPENAI_BASE_URL,
+	ZENMUX_ROUTER_API,
+	asZenmuxRouterModels,
 	fetchZenmuxModels,
 	getBasePrice,
 	routeModel,
@@ -85,6 +87,35 @@ test("routeModel routes non-anthropic ids to openai endpoint", () => {
 
 	assert.equal(routed.api, "openai-completions");
 	assert.equal(routed.baseUrl, ZENMUX_OPENAI_BASE_URL);
+});
+
+test("asZenmuxRouterModels forces all model APIs to zenmux-router", () => {
+	const models = asZenmuxRouterModels([
+		{
+			id: "anthropic/claude-opus-4.6",
+			name: "Anthropic: Claude Opus 4.6",
+			api: "anthropic-messages",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+			contextWindow: 1000000,
+			maxTokens: 32768,
+		},
+		{
+			id: "openai/gpt-5.3-chat",
+			name: "OpenAI: GPT-5.3 Chat",
+			api: "openai-completions",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
+			contextWindow: 128000,
+			maxTokens: 32768,
+		},
+	]);
+
+	assert.equal(models.length, 2);
+	assert.equal(models[0]?.api, ZENMUX_ROUTER_API);
+	assert.equal(models[1]?.api, ZENMUX_ROUTER_API);
 });
 
 test("fetchZenmuxModels maps API response and deduplicates by id", async () => {

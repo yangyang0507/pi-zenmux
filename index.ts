@@ -11,6 +11,7 @@ import type { ExtensionAPI, ProviderModelConfig } from "@mariozechner/pi-coding-
 export const ZENMUX_BASE_URL = (process.env.ZENMUX_BASE_URL || "https://zenmux.ai").replace(/\/$/, "");
 export const ZENMUX_OPENAI_BASE_URL = `${ZENMUX_BASE_URL}/api/v1`;
 export const ZENMUX_ANTHROPIC_BASE_URL = `${ZENMUX_BASE_URL}/api/anthropic`;
+export const ZENMUX_ROUTER_API = "zenmux-router";
 
 export const MODEL_DISCOVERY_TIMEOUT_MS = 8000;
 export const DEFAULT_CONTEXT_WINDOW = 128000;
@@ -267,6 +268,13 @@ export function routeModel(model: Model<Api>): Model<Api> {
 	};
 }
 
+export function asZenmuxRouterModels(models: ProviderModelConfig[]): ProviderModelConfig[] {
+	return models.map((model) => ({
+		...model,
+		api: ZENMUX_ROUTER_API,
+	}));
+}
+
 export function streamSimpleZenmux(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
 	const routedModel = routeModel(model);
 	if (routedModel.api === "anthropic-messages") {
@@ -277,12 +285,13 @@ export function streamSimpleZenmux(model: Model<Api>, context: Context, options?
 
 export default async function registerZenmuxProvider(pi: ExtensionAPI): Promise<void> {
 	const models = await fetchZenmuxModels();
+	const routerModels = asZenmuxRouterModels(models);
 
 	pi.registerProvider("zenmux", {
 		baseUrl: ZENMUX_OPENAI_BASE_URL,
 		apiKey: "ZENMUX_API_KEY",
-		api: "zenmux-router",
-		models,
+		api: ZENMUX_ROUTER_API,
+		models: routerModels,
 		streamSimple: streamSimpleZenmux,
 	});
 }
