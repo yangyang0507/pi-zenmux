@@ -6,11 +6,10 @@ This package adds a `zenmux` provider to pi using the extension API (`registerPr
 
 - Registers provider name: `zenmux`
 - Uses API key env var: `ZENMUX_API_KEY`
-- Uses bundled model snapshot (`zenmux-models.generated.js`) at runtime
+- Fetches live model list from `https://zenmux.ai/api/v1/models` at runtime
 - Routes Anthropic models to `https://zenmux.ai/api/anthropic` with `anthropic-messages`
 - Routes non-Anthropic models to `https://zenmux.ai/api/v1` with `openai-completions`
-- Model `maxTokens` is merged from `https://models.dev/api.json` during generation
-
+- Model `maxTokens` is merged from `https://models.dev/api.json` at runtime
 ## Install
 
 ### Local path
@@ -68,7 +67,6 @@ The extension derives:
 ## Publish
 
 ```bash
-npm run generate:models
 npm run check
 npm login
 npm publish --access public
@@ -78,7 +76,6 @@ npm publish --access public
 
 ```bash
 npm install
-npm run generate:models
 npm run typecheck
 npm test
 ```

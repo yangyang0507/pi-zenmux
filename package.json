@@ -1,6 +1,6 @@
 {
   "name": "pi-zenmux",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "ZenMux provider extension for pi-mono",
   "type": "module",
   "main": "./index.ts",
@@ -26,18 +26,15 @@
   ],
   "files": [
     "index.ts",
-    "zenmux-models.generated.d.ts",
-    "zenmux-models.generated.js",
     "README.md"
   ],
   "scripts": {
     "clean": "rm -rf dist .tsbuildinfo",
-    "generate:models": "node scripts/generate-models.mjs",
-    "build": "npm run clean && tsc -p tsconfig.json && cp zenmux-models.generated.js dist/zenmux-models.generated.js",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/index.test.js",
     "check": "npm run typecheck && npm run test",
-    "prepack": "npm run generate:models && npm run check"
+    "prepack": "npm run check"
   },
   "pi": {
     "extensions": [
@@ -50,7 +47,7 @@
   },
   "devDependencies": {
     "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-coding-agent": "^0.73.1",
     "@types/node": "^22.15.21",
     "typescript": "^5.8.3"
   }
