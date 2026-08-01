@@ -174,6 +174,7 @@ test("registerZenmuxProvider registers live model list", async () => {
 		assert.equal(providerConfig?.models?.length, 1);
 		assert.equal(providerConfig?.models?.[0]?.api, ZENMUX_ROUTER_API);
 		assert.equal(providerConfig?.models?.[0]?.maxTokens, 12345);
+		assert.equal(providerConfig?.apiKey, "$ZENMUX_API_KEY");
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
