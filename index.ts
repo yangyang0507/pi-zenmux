@@ -224,7 +224,7 @@ export default async function registerZenmuxProvider(pi: ExtensionAPI): Promise<
 	pi.registerProvider("zenmux", {
 		name: "ZenMux",
 		baseUrl: ZENMUX_OPENAI_BASE_URL,
-		apiKey: "ZENMUX_API_KEY",
+		apiKey: "$ZENMUX_API_KEY",
 		api: ZENMUX_ROUTER_API,
 		models: asZenmuxRouterModels(models),
 		streamSimple: streamSimpleZenmux,
