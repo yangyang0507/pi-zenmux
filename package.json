@@ -1,6 +1,6 @@
 {
   "name": "pi-zenmux",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "ZenMux provider extension for pi-mono",
   "type": "module",
   "main": "./index.ts",
@@ -42,12 +42,12 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "^0.73.1",
+    "@earendil-works/pi-ai": "^0.87.1",
+    "@earendil-works/pi-coding-agent": "^0.87.1",
     "@types/node": "^22.15.21",
     "typescript": "^5.8.3"
   }

@@ -1,30 +1,64 @@
-import {
-	type Api,
-	type Context,
-	type Model,
-	type SimpleStreamOptions,
-	streamSimpleAnthropic,
-	streamSimpleOpenAICompletions,
-} from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ProviderModelConfig } from "@mariozechner/pi-coding-agent";
+import type { Api, Model, ModelCost, ModelCostTier, ModelPromptCache, RefreshModelsContext } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
-const DEFAULT_CONTEXT_WINDOW = 128000;
-const DEFAULT_MAX_TOKENS = 32768;
-export const ZENMUX_MODELS_URL = "https://zenmux.ai/api/v1/models";
-export const MODELS_DEV_URL = "https://models.dev/api.json";
+/**
+ * ZenMux provider extension.
+ *
+ * ZenMux exposes OpenAI Chat Completions (`/api/v1`) and Anthropic Messages
+ * (`/api/anthropic`) for the same catalog, so this extension only supplies
+ * endpoints, model metadata, and catalog discovery; requests are converted and
+ * streamed by pi's built-in API implementations.
+ */
+
+const DEFAULT_CONTEXT_WINDOW = 128_000;
+const DEFAULT_MAX_TOKENS = 32_768;
+/** ZenMux documents a 5 minute default prompt-cache TTL and an optional 1 hour TTL. */
+const CACHE_SHORT_TTL_SECONDS = 5 * 60;
+const CACHE_LONG_TTL_SECONDS = 60 * 60;
+/** Throttle persisted catalog writes the same way pi's own remote catalog does. */
+const SNAPSHOT_WRITE_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const FETCH_TIMEOUT_MS = 8_000;
+/**
+ * Marker kept in the snapshot's opaque `etag` slot. A snapshot written by an
+ * older plugin version can carry a retired `api` id, so only snapshots written
+ * by this scheme are restored.
+ */
+const SNAPSHOT_TAG = "pi-zenmux/2";
 
 export const ZENMUX_BASE_URL = (process.env.ZENMUX_BASE_URL || "https://zenmux.ai").replace(/\/$/, "");
 export const ZENMUX_OPENAI_BASE_URL = `${ZENMUX_BASE_URL}/api/v1`;
 export const ZENMUX_ANTHROPIC_BASE_URL = `${ZENMUX_BASE_URL}/api/anthropic`;
-export const ZENMUX_ROUTER_API = "zenmux-router";
+export const ZENMUX_MODELS_URL = `${ZENMUX_OPENAI_BASE_URL}/models`;
+/** Per-endpoint catalog ZenMux's own agent plugins read; it carries the real output cap per model. */
+export const ZENMUX_ENDPOINT_CATALOG_URL = `${ZENMUX_BASE_URL}/api/frontend/model/available/list`;
+export const MODELS_DEV_URL = "https://models.dev/api.json";
+export const ZENMUX_PROVIDER_ID = "zenmux";
+export const ZENMUX_OPENAI_API = "openai-completions";
+export const ZENMUX_ANTHROPIC_API = "anthropic-messages";
 
-type PricingTier = {
+/** Cache-write pricing keys, most accurate first: pi's default Anthropic cache TTL is 5 minutes. */
+const CACHE_WRITE_KEYS = ["input_cache_write_5_min", "input_cache_write", "input_cache_write_1_h"] as const;
+
+type PromptTokenCondition = {
+	gte?: number | string | null;
+	gt?: number | string | null;
+	lt?: number | string | null;
+	lte?: number | string | null;
+};
+
+type ZenmuxPricing = {
 	value?: number;
-	conditions?: {
-		prompt_tokens?: {
-			gte?: number;
-		};
-	};
+	unit?: string;
+	conditions?: { prompt_tokens?: PromptTokenCondition | null } | null;
+};
+
+type ZenmuxPricings = {
+	prompt?: ZenmuxPricing[];
+	completion?: ZenmuxPricing[];
+	input_cache_read?: ZenmuxPricing[];
+	input_cache_write?: ZenmuxPricing[];
+	input_cache_write_5_min?: ZenmuxPricing[];
+	input_cache_write_1_h?: ZenmuxPricing[];
 };
 
 type ZenmuxRawModel = {
@@ -32,15 +66,9 @@ type ZenmuxRawModel = {
 	display_name?: string;
 	owned_by?: string;
 	input_modalities?: string[];
-	capabilities?: {
-		reasoning?: boolean;
-	};
-	pricings?: {
-		prompt?: PricingTier[];
-		completion?: PricingTier[];
-		input_cache_read?: PricingTier[];
-		input_cache_write_5_min?: PricingTier[];
-	};
+	output_modalities?: string[];
+	capabilities?: { reasoning?: boolean };
+	pricings?: ZenmuxPricings;
 	context_length?: number | string;
 };
 
@@ -48,185 +76,357 @@ type ZenmuxModelsPayload = {
 	data?: ZenmuxRawModel[];
 };
 
+/**
+ * A catalog model always carries routing, which `ProviderModelConfig` leaves optional.
+ * Pi stores catalog snapshots as `Model` rows, so the narrow type keeps that conversion honest.
+ */
+export type ZenmuxModel = ProviderModelConfig & { api: Api; baseUrl: string };
+
 function toPositiveInt(value: unknown, fallback: number): number {
 	const num = typeof value === "number" ? value : Number(value);
 	if (!Number.isFinite(num) || num <= 0) return fallback;
 	return Math.floor(num);
 }
 
-function getBasePrice(items: PricingTier[] | undefined): number {
-	if (!Array.isArray(items) || items.length === 0) return 0;
-
-	const baseline = items.find((item) => {
-		if (!item || typeof item !== "object") return false;
-		const promptTokens = item.conditions?.prompt_tokens;
-		return !item.conditions || (promptTokens?.gte ?? 0) === 0;
-	});
-
-	const value = baseline?.value ?? items[0]?.value ?? 0;
-	return Number.isFinite(value) ? value : 0;
+function toNonNegativeNumber(value: unknown): number | undefined {
+	if (value === null || value === undefined) return undefined;
+	const num = typeof value === "number" ? value : Number(value);
+	return Number.isFinite(num) && num >= 0 ? num : undefined;
 }
 
-function isAnthropicModel(model: ZenmuxRawModel): boolean {
-	return model.owned_by === "anthropic" || String(model.id || "").startsWith("anthropic/");
+function finitePrice(item: ZenmuxPricing | undefined): number | undefined {
+	const value = item?.value;
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
-function resolveModelsDevMaxTokens(model: Record<string, unknown>): number | undefined {
-	const limit = typeof model.limit === "object" && model.limit ? (model.limit as Record<string, unknown>) : undefined;
+/** Lower bound of the prompt-token range a pricing row applies to, in kTokens. */
+function priceLowerBound(item: ZenmuxPricing): number {
+	const condition = item?.conditions?.prompt_tokens;
+	return toNonNegativeNumber(condition?.gte) ?? toNonNegativeNumber(condition?.gt) ?? 0;
+}
 
-	const candidates = [
-		limit?.output,
-		limit?.max_output_tokens,
-		limit?.max_tokens,
-		model.max_output_tokens,
-		model.max_tokens,
-		model.output_tokens,
-	];
-
-	for (const candidate of candidates) {
-		const parsed = toPositiveInt(candidate, 0);
-		if (parsed > 0) return parsed;
+/** Row that applies below every other row: the cheapest prompt size the provider prices. */
+function baselineEntry(items: ZenmuxPricing[] | undefined): ZenmuxPricing | undefined {
+	let baseline: ZenmuxPricing | undefined;
+	let lowestBound = Number.POSITIVE_INFINITY;
+	for (const item of items ?? []) {
+		if (!item || typeof item !== "object") continue;
+		const bound = priceLowerBound(item);
+		if (bound < lowestBound) {
+			baseline = item;
+			lowestBound = bound;
+		}
 	}
+	return baseline;
+}
 
+function basePrice(items: ZenmuxPricing[] | undefined): number {
+	return finitePrice(baselineEntry(items)) ?? 0;
+}
+
+function pricedField(pricings: ZenmuxPricings | undefined, keys: readonly (keyof ZenmuxPricings)[]): number | undefined {
+	for (const key of keys) {
+		const items = pricings?.[key];
+		if (!Array.isArray(items) || items.length === 0) continue;
+		const value = finitePrice(baselineEntry(items));
+		if (value !== undefined) return value;
+	}
 	return undefined;
 }
 
-function buildModelsDevMaxTokensMap(modelsDevPayload: Record<string, unknown>): Map<string, number> {
-	const map = new Map<string, number>();
-
-	for (const providerValue of Object.values(modelsDevPayload)) {
-		if (!providerValue || typeof providerValue !== "object") continue;
-		const models = (providerValue as { models?: Record<string, unknown> }).models;
-		if (!models || typeof models !== "object") continue;
-
-		for (const [modelId, modelInfo] of Object.entries(models)) {
-			if (!modelInfo || typeof modelInfo !== "object") continue;
-			const maxTokens = resolveModelsDevMaxTokens(modelInfo as Record<string, unknown>);
-			if (!maxTokens) continue;
-			map.set(modelId, maxTokens);
-		}
+function tieredPrice(items: ZenmuxPricing[] | undefined, threshold: number, fallback: number): number {
+	if (threshold <= 0) return fallback;
+	for (const item of items ?? []) {
+		if (priceLowerBound(item) !== threshold) continue;
+		const value = finitePrice(item);
+		if (value !== undefined) return value;
 	}
-
-	return map;
+	return fallback;
 }
 
-function toProviderModel(rawModel: ZenmuxRawModel, modelsDevMaxTokens: Map<string, number>): ProviderModelConfig | null {
-	const id = String(rawModel.id || "").trim();
-	if (!id) return null;
+function tieredCacheWrite(pricings: ZenmuxPricings | undefined, threshold: number, fallback: number): number {
+	for (const key of CACHE_WRITE_KEYS) {
+		const items = pricings?.[key];
+		if (!Array.isArray(items) || items.length === 0) continue;
+		return tieredPrice(items, threshold, fallback);
+	}
+	return fallback;
+}
 
+/**
+ * ZenMux selects pricing rows by prompt-token range and applies one row to the
+ * whole request, which matches pi's request-wide `cost.tiers`. Tiers are only
+ * emitted when prompt and completion pricing agree on the same thresholds.
+ */
+function buildCostTiers(pricings: ZenmuxPricings | undefined): ModelCostTier[] | undefined {
+	const thresholds = new Set<number>();
+	for (const item of pricings?.prompt ?? []) {
+		const bound = priceLowerBound(item);
+		if (bound > 0) thresholds.add(bound);
+	}
+	if (thresholds.size === 0) return undefined;
+
+	const completionThresholds = new Set<number>();
+	for (const item of pricings?.completion ?? []) {
+		const bound = priceLowerBound(item);
+		if (bound > 0) completionThresholds.add(bound);
+	}
+	if ([...thresholds].some((threshold) => !completionThresholds.has(threshold))) return undefined;
+
+	const input = basePrice(pricings?.prompt);
+	const output = basePrice(pricings?.completion);
+	const cacheRead = basePrice(pricings?.input_cache_read);
+	const cacheWrite = pricedField(pricings, CACHE_WRITE_KEYS) ?? 0;
+
+	return [...thresholds]
+		.sort((a, b) => a - b)
+		.map((threshold) => ({
+			inputTokensAbove: Math.round(threshold * 1000),
+			input: tieredPrice(pricings?.prompt, threshold, input),
+			output: tieredPrice(pricings?.completion, threshold, output),
+			cacheRead: tieredPrice(pricings?.input_cache_read, threshold, cacheRead),
+			cacheWrite: tieredCacheWrite(pricings, threshold, cacheWrite),
+		}));
+}
+
+function buildCost(pricings: ZenmuxPricings | undefined): ModelCost {
+	const cost: ModelCost = {
+		input: basePrice(pricings?.prompt),
+		output: basePrice(pricings?.completion),
+		cacheRead: basePrice(pricings?.input_cache_read),
+		cacheWrite: pricedField(pricings, CACHE_WRITE_KEYS) ?? 0,
+	};
+	const tiers = buildCostTiers(pricings);
+	if (tiers) cost.tiers = tiers;
+	return cost;
+}
+
+/**
+ * ZenMux omits `pricings` for some catalog entries, so those models fall back to
+ * the models.dev pricing. Cache warming is only enabled for models whose cache
+ * writes are priced, because warming re-sends a request and pays that price.
+ */
+function resolvePricing(
+	pricings: ZenmuxPricings | undefined,
+	fallback: ModelCost | undefined,
+): { cost: ModelCost; promptCache: ModelPromptCache | undefined } {
+	const hasOwnPricing = (pricings?.prompt?.length ?? 0) > 0 || (pricings?.completion?.length ?? 0) > 0;
+	if (!hasOwnPricing && fallback) {
+		return { cost: fallback, promptCache: fallback.cacheWrite > 0 ? { short: CACHE_SHORT_TTL_SECONDS } : undefined };
+	}
+
+	const cacheWrite = pricedField(pricings, CACHE_WRITE_KEYS);
+	const longTtl = pricedField(pricings, ["input_cache_write_1_h"]);
+	return {
+		cost: buildCost(pricings),
+		promptCache:
+			cacheWrite === undefined
+				? undefined
+				: longTtl === undefined
+					? { short: CACHE_SHORT_TTL_SECONDS }
+					: { short: CACHE_SHORT_TTL_SECONDS, long: CACHE_LONG_TTL_SECONDS },
+	};
+}
+
+export function routingFor(rawModel: ZenmuxRawModel): { api: string; baseUrl: string } {
+	const id = String(rawModel?.id ?? "");
+	const isAnthropic = rawModel?.owned_by === "anthropic" || id.startsWith("anthropic/");
+	return isAnthropic
+		? { api: ZENMUX_ANTHROPIC_API, baseUrl: ZENMUX_ANTHROPIC_BASE_URL }
+		: { api: ZENMUX_OPENAI_API, baseUrl: ZENMUX_OPENAI_BASE_URL };
+}
+
+/**
+ * Smallest `max_completion_tokens` ZenMux advertises across a model's endpoints.
+ * The documented catalog carries no output cap, and models.dev reports the upstream
+ * vendor's limit, which differs from what ZenMux accepts on 95 of 168 chat models.
+ */
+export function buildEndpointOutputLimits(payload: unknown): Map<string, number> {
+	const limits = new Map<string, number>();
+	const rows = (payload as { data?: unknown } | undefined)?.data;
+	if (!Array.isArray(rows)) return limits;
+
+	for (const row of rows) {
+		if (!row || typeof row !== "object") continue;
+		const id = String((row as { slug?: unknown }).slug ?? "").trim();
+		const cap = toPositiveInt((row as { max_completion_tokens?: unknown }).max_completion_tokens, 0);
+		if (!id || cap === 0) continue;
+		const current = limits.get(id);
+		if (current === undefined || cap < current) limits.set(id, cap);
+	}
+	return limits;
+}
+
+/** Output limits and prices are missing for some ZenMux catalog entries, so models.dev fills them in. */
+export function buildModelsDevFallbacks(payload: unknown): Map<string, { outputLimit?: number; cost?: ModelCost }> {
+	const fallbacks = new Map<string, { outputLimit?: number; cost?: ModelCost }>();
+	const models = (payload as { zenmux?: { models?: Record<string, unknown> } } | undefined)?.zenmux?.models;
+	for (const [id, entry] of Object.entries(models ?? {})) {
+		if (!entry || typeof entry !== "object") continue;
+		const outputLimit = toPositiveInt((entry as { limit?: { output?: unknown } }).limit?.output, 0);
+		const rawCost = (entry as { cost?: { input?: unknown; output?: unknown; cache_read?: unknown; cache_write?: unknown } }).cost;
+		const input = toNonNegativeNumber(rawCost?.input);
+		const output = toNonNegativeNumber(rawCost?.output);
+		const cost =
+			input === undefined || output === undefined
+				? undefined
+				: {
+						input,
+						output,
+						cacheRead: toNonNegativeNumber(rawCost?.cache_read) ?? 0,
+						cacheWrite: toNonNegativeNumber(rawCost?.cache_write) ?? 0,
+					};
+		if (outputLimit > 0 || cost) {
+			fallbacks.set(id, { ...(outputLimit > 0 ? { outputLimit } : {}), ...(cost ? { cost } : {}) });
+		}
+	}
+	return fallbacks;
+}
+
+export function toProviderModel(
+	rawModel: ZenmuxRawModel,
+	outputLimits: Map<string, number>,
+	fallbacks: Map<string, { outputLimit?: number; cost?: ModelCost }>,
+): ZenmuxModel | null {
+	const id = String(rawModel?.id ?? "").trim();
+	if (!id) return null;
+	// ZenMux serves image, video, speech, embedding, and rerank models from the same catalog.
+	const outputs = rawModel.output_modalities;
+	if (Array.isArray(outputs) && outputs.length > 0 && !outputs.includes("text")) return null;
+
+	const fallback = fallbacks.get(id);
+	const { cost, promptCache } = resolvePricing(rawModel.pricings, fallback?.cost);
+	const routing = routingFor(rawModel);
 	const supportsImage = Array.isArray(rawModel.input_modalities) && rawModel.input_modalities.includes("image");
-	const maxTokensFromModelsDev = modelsDevMaxTokens.get(id);
 
 	return {
 		id,
 		name: String(rawModel.display_name || id),
-		api: isAnthropicModel(rawModel) ? "anthropic-messages" : "openai-completions",
-		reasoning: Boolean(rawModel.capabilities?.reasoning),
+		api: routing.api,
+		baseUrl: routing.baseUrl,
+		reasoning: rawModel.capabilities?.reasoning === true,
 		input: supportsImage ? ["text", "image"] : ["text"],
-		cost: {
-			input: getBasePrice(rawModel.pricings?.prompt),
-			output: getBasePrice(rawModel.pricings?.completion),
-			cacheRead: getBasePrice(rawModel.pricings?.input_cache_read),
-			cacheWrite: getBasePrice(rawModel.pricings?.input_cache_write_5_min),
-		},
+		cost,
 		contextWindow: toPositiveInt(rawModel.context_length, DEFAULT_CONTEXT_WINDOW),
-		maxTokens: maxTokensFromModelsDev ?? DEFAULT_MAX_TOKENS,
+		maxTokens: outputLimits.get(id) ?? fallback?.outputLimit ?? DEFAULT_MAX_TOKENS,
+		...(promptCache ? { promptCache } : {}),
 	};
 }
 
-const FETCH_TIMEOUT_MS = 15_000;
+async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+	const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+	const response = await fetch(url, {
+		method: "GET",
+		headers: { Accept: "application/json" },
+		signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+	});
 
-async function fetchJson<T>(url: string, timeoutMs: number = FETCH_TIMEOUT_MS): Promise<T> {
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-	try {
-		const response = await fetch(url, {
-			method: "GET",
-			headers: { Accept: "application/json" },
-			signal: controller.signal,
-		});
-
-		if (!response.ok) {
-			throw new Error(`${url} -> HTTP ${response.status}`);
-		}
-
-		return (await response.json()) as T;
-	} finally {
-		clearTimeout(timer);
+	if (!response.ok) {
+		throw new Error(`${url} -> HTTP ${response.status}`);
 	}
+
+	return (await response.json()) as T;
 }
 
-export async function fetchZenmuxProviderModels(): Promise<ProviderModelConfig[]> {
-	const [zenmuxPayload, modelsDevPayload] = await Promise.all([
-		fetchJson<ZenmuxModelsPayload>(ZENMUX_MODELS_URL),
-		fetchJson<Record<string, unknown>>(MODELS_DEV_URL).catch(() => undefined),
+export async function fetchZenmuxProviderModels(options: { signal?: AbortSignal } = {}): Promise<ZenmuxModel[]> {
+	const [zenmuxPayload, endpointsPayload, modelsDevPayload] = await Promise.all([
+		fetchJson<ZenmuxModelsPayload>(ZENMUX_MODELS_URL, options.signal),
+		fetchJson<Record<string, unknown>>(ZENMUX_ENDPOINT_CATALOG_URL, options.signal).catch(() => undefined),
+		fetchJson<Record<string, unknown>>(MODELS_DEV_URL, options.signal).catch(() => undefined),
 	]);
 
-	const zenmuxModels = Array.isArray(zenmuxPayload?.data) ? zenmuxPayload.data : [];
-	if (zenmuxModels.length === 0) {
+	const rawModels = Array.isArray(zenmuxPayload?.data) ? zenmuxPayload.data : [];
+	if (rawModels.length === 0) {
 		throw new Error("ZenMux model list is empty");
 	}
 
-	const modelsDevMaxTokens = modelsDevPayload
-		? buildModelsDevMaxTokensMap(modelsDevPayload)
-		: new Map<string, number>();
+	const outputLimits = endpointsPayload ? buildEndpointOutputLimits(endpointsPayload) : new Map<string, number>();
+	const fallbacks = modelsDevPayload
+		? buildModelsDevFallbacks(modelsDevPayload)
+		: new Map<string, { outputLimit?: number; cost?: ModelCost }>();
 
-	const uniqueModels = new Map<string, ProviderModelConfig>();
-	for (const rawModel of zenmuxModels) {
-		const model = toProviderModel(rawModel, modelsDevMaxTokens);
+	const uniqueModels = new Map<string, ZenmuxModel>();
+	for (const rawModel of rawModels) {
+		const model = toProviderModel(rawModel, outputLimits, fallbacks);
 		if (!model) continue;
 		uniqueModels.set(model.id, model);
 	}
 
 	const models = [...uniqueModels.values()].sort((a, b) => a.id.localeCompare(b.id));
 	if (models.length === 0) {
-		throw new Error("No valid models fetched");
+		throw new Error("No ZenMux chat models found");
 	}
 
 	return models;
 }
 
-export function routeModel(model: Model<Api>): Model<Api> {
-	if (model.id.startsWith("anthropic/")) {
-		const { compat: _compat, ...rest } = model as Model<Api> & { compat?: unknown };
-		return {
-			...rest,
-			api: "anthropic-messages",
-			baseUrl: ZENMUX_ANTHROPIC_BASE_URL,
-		};
-	}
-
-	return {
-		...model,
-		api: "openai-completions",
-		baseUrl: ZENMUX_OPENAI_BASE_URL,
-	};
+/**
+ * Restore a persisted snapshot. Routing is re-derived so a snapshot written for
+ * a different `ZENMUX_BASE_URL` still points at the configured endpoints.
+ */
+export function restoreModels(storedModels: readonly Model<Api>[]): ZenmuxModel[] {
+	return storedModels.map((model) => {
+		const routing = routingFor({ id: model.id, owned_by: (model as { owned_by?: string }).owned_by });
+		return { ...model, api: routing.api, baseUrl: routing.baseUrl };
+	});
 }
 
-export function asZenmuxRouterModels(models: ProviderModelConfig[]): ProviderModelConfig[] {
-	return models.map((model) => ({
-		...model,
-		api: ZENMUX_ROUTER_API,
-	}));
+/** Snapshots written by an older scheme can carry a retired `api` id, so they are ignored. */
+function restoreSnapshot(stored: RefreshModelsContext["stored"]): ZenmuxModel[] {
+	if (stored?.etag !== SNAPSHOT_TAG || !Array.isArray(stored.models) || stored.models.length === 0) return [];
+	return restoreModels(stored.models);
 }
 
-export function streamSimpleZenmux(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
-	const routedModel = routeModel(model);
-	if (routedModel.api === "anthropic-messages") {
-		return streamSimpleAnthropic(routedModel as Model<"anthropic-messages">, context, options);
+/** The snapshot is rewritten when the catalog changed, and otherwise at most every few hours. */
+function shouldPersist(
+	storedModels: readonly ZenmuxModel[],
+	checkedAt: number | undefined,
+	models: readonly ZenmuxModel[],
+): boolean {
+	if (storedModels.length !== models.length) return true;
+	if (storedModels.some((model, index) => model.id !== models[index]?.id)) return true;
+	return Date.now() - (checkedAt ?? 0) > SNAPSHOT_WRITE_INTERVAL_MS;
+}
+
+/** Models fetched by the extension factory; they take precedence over the persisted snapshot. */
+let discoveredModels: ZenmuxModel[] | undefined;
+
+export async function refreshZenmuxModels(context: RefreshModelsContext): Promise<ZenmuxModel[]> {
+	const stored = restoreSnapshot(context.stored);
+
+	let fresh = discoveredModels;
+	if ((!fresh || context.force) && context.allowNetwork && !context.signal.aborted) {
+		try {
+			fresh = await fetchZenmuxProviderModels({ signal: context.signal });
+		} catch {
+			// Keep whatever catalog we already have when discovery fails.
+			return fresh ?? stored;
+		}
+		if (context.signal.aborted) return fresh ?? stored;
 	}
-	return streamSimpleOpenAICompletions(routedModel as Model<"openai-completions">, context, options);
+	if (!fresh) return stored;
+
+	if (shouldPersist(stored, context.stored?.checkedAt, fresh)) {
+		await context.publish({
+			persist: {
+				models: fresh.map((model): Model<Api> => ({ ...model, provider: ZENMUX_PROVIDER_ID })),
+				checkedAt: Date.now(),
+				etag: SNAPSHOT_TAG,
+			},
+		});
+	}
+	return fresh;
 }
 
 export default async function registerZenmuxProvider(pi: ExtensionAPI): Promise<void> {
-	const models = await fetchZenmuxProviderModels();
-	pi.registerProvider("zenmux", {
+	discoveredModels = await fetchZenmuxProviderModels().catch(() => undefined);
+
+	pi.registerProvider(ZENMUX_PROVIDER_ID, {
 		name: "ZenMux",
 		baseUrl: ZENMUX_OPENAI_BASE_URL,
-		apiKey: "ZENMUX_API_KEY",
-		api: ZENMUX_ROUTER_API,
-		models: asZenmuxRouterModels(models),
-		streamSimple: streamSimpleZenmux,
+		apiKey: "$ZENMUX_API_KEY",
+		api: ZENMUX_OPENAI_API,
+		models: discoveredModels ?? [],
+		refreshModels: refreshZenmuxModels,
 	});
 }
